@@ -9,6 +9,7 @@ defmodule Membrane.H265.TimestampGenerationTest do
 
   alias Membrane.Buffer
   alias Membrane.H265.Parser
+  alias Membrane.H26x.ParsingEngine
   alias Membrane.H26x.Support.TestSource
   alias Membrane.Testing.{Pipeline, Sink}
 
@@ -131,6 +132,47 @@ defmodule Membrane.H265.TimestampGenerationTest do
     end)
 
     Pipeline.terminate(pid)
+  end
+
+  test "alignment changes flush generated timestamps and retain generation state" do
+    binary = File.read!(@h265_input_file_main)
+
+    engine =
+      ParsingEngine.new(%{
+        codec: :h265,
+        input_alignment: :bytestream,
+        input_stream_structure: :annexb,
+        generate_best_effort_timestamps: %{framerate: {1, 1}, add_dts_offset: false}
+      })
+
+    {initial_events, engine} = ParsingEngine.push(engine, binary)
+    assert engine.au_timestamp_generator.buffer != []
+    {expected_flush, _engine} = ParsingEngine.flush(engine)
+    {flushed_events, engine} = ParsingEngine.reconfigure_input(engine, :au, :annexb)
+    assert flushed_events == expected_flush
+    assert Enum.any?(flushed_events, &match?({:access_unit, _au}, &1))
+    assert engine.au_timestamp_generator.buffer == []
+
+    generated_timestamps = access_unit_timestamps(initial_events ++ flushed_events)
+    generator = engine.au_timestamp_generator
+    [first_buffer | _buffers] = prepare_h265_buffers(binary, :au)
+    {aligned_events, engine} = ParsingEngine.push(engine, first_buffer.payload, {20, 10})
+    assert access_unit_timestamps(aligned_events) == [{20, 10}]
+    assert engine.au_timestamp_generator == generator
+
+    {[], engine} = ParsingEngine.reconfigure_input(engine, :bytestream, :annexb)
+    {resumed_events, engine} = ParsingEngine.push(engine, binary)
+    {final_events, engine} = ParsingEngine.flush(engine)
+    offset = length(generated_timestamps) * Membrane.Time.second()
+
+    assert access_unit_timestamps(resumed_events ++ final_events) ==
+             Enum.map(generated_timestamps, fn {pts, dts} -> {pts + offset, dts + offset} end)
+
+    assert {[], _engine} = ParsingEngine.flush(engine)
+  end
+
+  defp access_unit_timestamps(events) do
+    for {:access_unit, au} <- events, do: au.timestamps
   end
 
   defp process_test(file, timestamps, dts_offset \\ true) do

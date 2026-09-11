@@ -18,7 +18,6 @@ defmodule Membrane.H26x.ParsingEngine do
   alias Membrane.H26x.{AccessUnit, NALu}
 
   alias Membrane.H26x.ParsingEngine.{
-    AUDTSInferer,
     AUSplitter,
     AUTimestampGenerator,
     NALuParser,
@@ -135,8 +134,7 @@ defmodule Membrane.H26x.ParsingEngine do
             nalu_splitter: NALuSplitter.t(),
             nalu_parser: NALuParser.t(),
             au_splitter: AUSplitter.t(),
-            au_timestamp_generator: AUTimestampGenerator.state() | nil,
-            au_dts_inferer: AUDTSInferer.state() | nil,
+            au_timestamp_generator: AUTimestampGenerator.state(),
             parameter_set_cache: ParameterSetCache.t(),
             input_alignment: input_alignment(),
             input_stream_structure: stream_structure(),
@@ -155,7 +153,6 @@ defmodule Membrane.H26x.ParsingEngine do
     :nalu_parser,
     :au_splitter,
     :au_timestamp_generator,
-    :au_dts_inferer,
     :parameter_set_cache,
     :input_alignment,
     :input_stream_structure,
@@ -182,13 +179,19 @@ defmodule Membrane.H26x.ParsingEngine do
 
     validate_timestamp_options!(codec, generate_best_effort_timestamps, infer_dts_from_pts)
 
-    au_timestamp_generator =
-      case generate_best_effort_timestamps do
-        false -> nil
-        cfg -> AUTimestampGenerator.new(au_timestamp_generator_mod(config.codec), cfg)
+    timestamp_mode =
+      cond do
+        generate_best_effort_timestamps != false -> :generate_best_effort_timestamps
+        infer_dts_from_pts -> :infer_dts_from_pts
+        true -> :passthrough
       end
 
-    au_dts_inferer = if infer_dts_from_pts, do: AUDTSInferer.new(), else: nil
+    au_timestamp_generator =
+      AUTimestampGenerator.new(
+        au_timestamp_generator_mod(codec),
+        timestamp_mode,
+        generate_best_effort_timestamps || %{}
+      )
 
     %__MODULE__{
       codec: codec,
@@ -196,7 +199,6 @@ defmodule Membrane.H26x.ParsingEngine do
       nalu_parser: NALuParser.new(input_stream_structure),
       au_splitter: AUSplitter.new(),
       au_timestamp_generator: au_timestamp_generator,
-      au_dts_inferer: au_dts_inferer,
       parameter_set_cache: ParameterSetCache.new(),
       input_alignment: config.input_alignment,
       input_stream_structure: input_stream_structure,
@@ -472,49 +474,18 @@ defmodule Membrane.H26x.ParsingEngine do
   defp out_of_band_parameter_sets_codec_tags(:h264), do: [:avc1]
   defp out_of_band_parameter_sets_codec_tags(:h265), do: [:hvc1]
 
-  defguardp is_timestamp_generator_active(engine)
-            when engine.input_alignment == :bytestream and
-                   not is_nil(engine.au_timestamp_generator)
-
-  defguardp is_dts_inferer_active(engine) when not is_nil(engine.au_dts_inferer)
-
   @spec maybe_generate_timestamps([AUSplitter.access_unit()], boolean(), t()) ::
           {[{AUSplitter.access_unit(), NALu.timestamps()}], t()}
-  defp maybe_generate_timestamps(aus, flush?, engine)
-       when is_timestamp_generator_active(engine) do
+  defp maybe_generate_timestamps(aus, flush?, engine) do
     {timestamped_aus, generator} =
       AUTimestampGenerator.generate_timestamps(
         engine.au_timestamp_generator_mod,
         aus,
-        flush?,
+        [flush?: flush?, input_alignment: engine.input_alignment],
         engine.au_timestamp_generator
       )
 
     timestamped_aus = Enum.map(timestamped_aus, fn {au, pts, dts} -> {au, {pts, dts}} end)
     {timestamped_aus, %{engine | au_timestamp_generator: generator}}
-  end
-
-  defp maybe_generate_timestamps(aus, _flush?, engine) when is_dts_inferer_active(engine) do
-    {timestamped_aus, inferer} =
-      AUDTSInferer.infer_timestamps(
-        engine.au_timestamp_generator_mod,
-        aus,
-        engine.au_dts_inferer
-      )
-
-    timestamped_aus = Enum.map(timestamped_aus, fn {au, pts, dts} -> {au, {pts, dts}} end)
-    {timestamped_aus, %{engine | au_dts_inferer: inferer}}
-  end
-
-  defp maybe_generate_timestamps(aus, _flush?, engine), do: preserve_timestamps(aus, engine)
-
-  defp preserve_timestamps(aus, engine) do
-    timestamped_aus =
-      Enum.map(aus, fn au ->
-        first_vcl_nalu = engine.nalu_parser_mod.get_first_vcl_nalu(au)
-        {au, if(first_vcl_nalu, do: first_vcl_nalu.timestamps, else: {nil, nil})}
-      end)
-
-    {timestamped_aus, engine}
   end
 end
